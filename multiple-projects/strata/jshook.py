@@ -50,10 +50,22 @@ def _hook_js(token: str, timeout_ms: int) -> str:
     if(!txt) return null;
     try {{ return JSON.parse(txt); }} catch(e) {{ return null; }}
   }}
+  /* widget view ถูกสร้างหลัง comm วนกลับมา → ต้องรอให้ DOM โผล่ก่อน (ไม่ใช่ล้มทันที) */
+  function waitFor(sel, ms){{
+    return new Promise(function(resolve, reject){{
+      const t0 = Date.now();
+      (function loop(){{
+        const el = document.querySelector(sel);
+        if(el) return resolve(el);
+        if(Date.now() - t0 > ms) return reject(new Error('strata-hook: ไม่พบวิดเจ็ตสะพานในหน้านี้ (' + sel + ')'));
+        setTimeout(loop, 100);
+      }})();
+    }});
+  }}
   function send(act, payload){{
     return new Promise(function(resolve, reject){{
-      const req = findReq(), res = findRes();
-      if(!req || !res){{ reject(new Error('strata-hook: ไม่พบวิดเจ็ตสะพานในหน้านี้')); return; }}
+      Promise.all([waitFor(reqSel, 8000), waitFor(resSel, 8000)]).then(function(found){{
+        const req = found[0];
       const id = TOKEN + ':' + Date.now() + ':' + Math.random().toString(36).slice(2);
       const started = Date.now();
       const timer = setInterval(function(){{
@@ -64,6 +76,7 @@ def _hook_js(token: str, timeout_ms: int) -> str:
       req.value = JSON.stringify({{id: id, act: act, payload: payload || {{}}}});
       req.dispatchEvent(new Event('input', {{bubbles: true}}));
       req.dispatchEvent(new Event('change', {{bubbles: true}}));
+      }}).catch(reject);
     }});
   }}
   window.__strataHook = function(act, payload){{
@@ -89,8 +102,15 @@ def install_hook(
     timeout_ms: int = 180_000,
     verify_s: float = 4.0,
     display_widgets: bool = True,
+    emit: Callable[[str], Any] | None = None,
+    emit_widgets: Callable[[Any], Any] | None = None,
 ) -> dict:
     """ติดตั้งสะพาน JS→kernel แล้วคืนผลการติดตั้ง
+
+    ``emit`` = ฟังก์ชันที่ใช้แสดงสคริปต์ ถ้าไม่ส่งมาจะ ``display(Javascript(...))`` ที่ระดับเซลล์
+    **ควรส่ง emit ที่รันอยู่ใน ``ipywidgets.Output``** — บน Kaggle/JupyterLab สคริปต์ที่แสดง
+    ลอย ๆ ระดับเซลล์จะไม่ทำงาน (output อาจถูกแยกบริบท) แต่สคริปต์ที่รันใน Output widget
+    จะอยู่ใน DOM เดียวกับ widget ทั้งหมด ทำให้ ``document.querySelector`` หา widget เจอ
 
     คืน dict: ``{"ok": bool, "token": str, "note": str, "widgets": (req, res)}``
     ``ok=False`` แปลว่า frontend นี้ใช้สะพานไม่ได้ → ผู้เรียกควรแสดง ``strata.hybrid`` แทน
@@ -155,9 +175,15 @@ def install_hook(
 
     req.observe(_on_request, names="value")
 
-    if display_widgets:
+    if emit_widgets is not None:
+        emit_widgets(widgets.HBox([req, res]))
+    elif display_widgets:
         display(widgets.HBox([req, res]))
-    display(Javascript(_hook_js(token, timeout_ms)))
+    js = _hook_js(token, timeout_ms)
+    if emit is not None:
+        emit(js)
+    else:
+        display(Javascript(js))
 
     # ---- self-test: รอให้ __ping วนกลับมาถึง kernel ----
     note = ""
@@ -180,4 +206,37 @@ def install_hook(
     return {"ok": ok, "token": token, "note": note, "widgets": (req, res), "state": state}
 
 
-__all__ = ["install_hook", "PING_ACT"]
+def split_page(src: str) -> tuple[str, str, list[str]]:
+    """แยกหน้าจอ HTML ออกเป็น (body, css, [scripts])
+
+    ทำไมต้องแยก: JupyterLab/Kaggle กรอง ``<style>`` และ ``<script>`` ที่ฝังมาใน HTML ออก
+    (sanitizer) ทำให้หน้าจอที่แสดงกลายเป็นไม่มีสีและปุ่มกดไม่ติด → ต้องส่ง CSS/JS
+    ผ่าน ``Javascript(...)`` ซึ่ง frontend ยอมรันจริง
+    """
+    import re
+
+    css = "\n".join(m.group(1) for m in re.finditer(r"<style[^>]*>(.*?)</style>", src, flags=re.S))
+    scripts = re.findall(r"<script[^>]*>(.*?)</script>", src, flags=re.S)
+    body = re.sub(r"<style[^>]*>.*?</style>", "", src, flags=re.S)
+    body = re.sub(r"<script[^>]*>.*?</script>", "", body, flags=re.S)
+    return body, css, scripts
+
+
+def css_js(css: str, style_id: str = "strata-page-css") -> str:
+    """สร้าง JS ที่ฉีด CSS เข้า ``document.head`` (รันซ้ำได้ ไม่สร้างซ้ำ)"""
+    payload = json.dumps(css or "")
+    return (
+        "(function(){"
+        f"var ID={json.dumps(style_id)};var prev=document.getElementById(ID);if(prev)prev.remove();"
+        f"var s=document.createElement('style');s.id=ID;s.textContent={payload};"
+        "document.head.appendChild(s);"
+        "})();"
+    )
+
+
+def run_page_js(scripts: list[str]) -> str:
+    """รวมสคริปต์ของหน้าจอเป็นก้อนเดียว (รันที่ global scope เพื่อให้ onclick=... เรียกได้)"""
+    return "\n;\n".join(scripts)
+
+
+__all__ = ["install_hook", "split_page", "css_js", "run_page_js", "PING_ACT"]
