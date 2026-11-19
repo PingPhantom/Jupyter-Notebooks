@@ -75,6 +75,9 @@ SETUP_LOG = Path(STRATA_HOME) / "setup.log"
 
 
 def _is_colab_runtime() -> bool:
+    # Kaggle บางอิมเมจติด COLAB_* มาด้วย → ต้องกันไม่ให้เข้าใจผิดว่าเป็น Colab
+    if any(k.startswith("KAGGLE_") for k in os.environ) or Path("/kaggle/working").is_dir():
+        return False
     return "COLAB_RELEASE_TAG" in os.environ or "COLAB_GPU" in os.environ
 
 
@@ -170,11 +173,19 @@ def environment_plan(nix: str = "auto", name: str | None = None) -> dict:
     else:
         use_nix = name != "kaggle"
     notes = []
-    if use_nix and name == "kaggle":
-        notes.append(
-            'Kaggle ไม่มี systemd และรีเซ็ต /nix ทุกเซสชัน — Nix จะติดตั้งใหม่ทุกครั้ง (ช้า 5-20 นาที) '
-            'ถ้าไม่จำเป็นใช้ USE_NIX="never" (pip-only) จะเร็วกว่า'
-        )
+    if name == "kaggle" and use_nix:
+        forced = os.environ.get("STRATA_FORCE_NIX", "").strip().lower() in ("1", "true", "yes", "on")
+        if forced:
+            notes.append(
+                "⚠️ STRATA_FORCE_NIX เปิดอยู่ — ใช้ Nix บน Kaggle (ติดตั้งใหม่ทุก session 5-20 นาที) "
+                "ถ้าไม่จำเป็นถอด env นี้ออกเพื่อกลับไปโหมด pip-only"
+            )
+        else:
+            use_nix = False
+            notes.append(
+                "Kaggle ไม่มี systemd และ /nix ถูกล้างทุก session — บังคับโหมด pip-only ให้เลย "
+                "(จะใช้ Nix ก็ต่อเมื่อตั้ง env STRATA_FORCE_NIX=1)"
+            )
     if not use_nix:
         notes.append("โหมด pip-only: ไม่ต้องใช้ Nix/Docker — llama.cpp โหลดไบนารี prebuilt CUDA ให้เอง")
     return {"name": name, "nix": mode, "use_nix": use_nix, "steps": _plan_steps(use_nix), "notes": notes}
@@ -364,19 +375,43 @@ def _devshell_error(returncode: int, stderr: str, flake_dir: Path) -> str:
     )
 
 
+def _nix_timeout() -> int:
+    raw = os.environ.get("STRATA_NIX_TIMEOUT", "").strip()
+    try:
+        return max(60, int(raw))
+    except ValueError:
+        return 1800  # 30 นาที — กันค้างไม่จบ (nix develop ครั้งแรกโหลด store เยอะ)
+
+
 def activate_devshell(flake_dir: Path | None = None) -> dict:
     flake = Path(flake_dir or FLAKE_DIR)
     if not (flake / "flake.nix").is_file():
         write_flake(flake_dir=flake)
-    _log(f"⏳ กำลังโหลด Nix devshell จาก {flake} (ครั้งแรกอาจใช้เวลาหลายนาที)...")
-    proc = subprocess.run(
-        ["nix", "develop", str(flake), "--command", "python3", "-c", ENV_DUMP],
-        capture_output=True,
-        text=True,
-    )
+    timeout = _nix_timeout()
+    _log(f"⏳ กำลังโหลด Nix devshell จาก {flake} (ครั้งแรกอาจใช้เวลาหลายนาที, เพดาน {timeout}s)...")
+    try:
+        proc = subprocess.run(
+            ["nix", "develop", str(flake), "--command", "python3", "-c", ENV_DUMP],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(
+            f"`nix develop` ใช้เวลาเกิน {timeout}s — ยกเลิกการรอ\n--- วิธีแก้ ---\n"
+            '• ใช้โหมด pip-only เร็วกว่า: ตั้ง USE_NIX="never" (หรือไม่ต้องตั้งอะไรบน Kaggle ก็เป็น pip-only อยู่แล้ว)\n'
+            "• ถ้าอยากรอนานขึ้น ตั้ง env STRATA_NIX_TIMEOUT=3600"
+        ) from None
     if proc.returncode != 0:
         raise RuntimeError(_devshell_error(proc.returncode, proc.stderr, flake))
-    for key, val in json.loads(proc.stdout).items():
+    try:
+        env_dump = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        raise RuntimeError(
+            "`nix develop` รันจบแต่ไม่ได้คืนค่าสภาพแวดล้อม (stdout ไม่ใช่ JSON) — devshell อาจถูก interrupt\n"
+            f"--- stdout (ท้าย) ---\n{(proc.stdout or '').strip()[-500:] or '(ว่าง)'}"
+        ) from None
+    for key, val in env_dump.items():
         if key in ("_", "SHLVL", "PWD", "OLDPWD"):
             continue
         if key == "PATH":
@@ -385,7 +420,7 @@ def activate_devshell(flake_dir: Path | None = None) -> dict:
             os.environ["LD_LIBRARY_PATH"] = f"{val}:{NVIDIA_LIB_DIRS}"
         else:
             os.environ[key] = val
-    return {"flake_dir": str(flake), "vars": len(json.loads(proc.stdout))}
+    return {"flake_dir": str(flake), "vars": len(env_dump)}
 
 
 def nix_diagnostics() -> dict:
@@ -479,7 +514,8 @@ def ensure_environment(skip_devshell: bool = False, nix: str = "auto") -> dict:
     _step("ตั้งค่า PATH/ตัวแปรระบบ")
     ensure_paths()
 
-    if plan["use_nix"]:
+    use_nix = plan["use_nix"]
+    if use_nix:
         _step("ติดตั้ง Nix (3-8 นาที ถ้ายังไม่มี)")
         write_nix_conf()
         install_nix()
@@ -492,24 +528,31 @@ def ensure_environment(skip_devshell: bool = False, nix: str = "auto") -> dict:
             _step("โหลด devshell (ขั้นที่ช้าที่สุด)")
             try:
                 activate_devshell()
+            except KeyboardInterrupt:
+                use_nix = False
+                rprint(
+                    "[yellow]⏹️ ยกเลิกการรอ Nix devshell — สลับไปโหมด pip-only ให้อัตโนมัติ "
+                    "(ครั้งหน้าตั้ง USE_NIX=\"never\" เพื่อข้ามขั้นนี้ไปเลย)[/yellow]"
+                )
             except RuntimeError:
                 rprint("[bold red]❌ โหลด Nix devshell ไม่สำเร็จ — ข้อมูลดีบัก:[/bold red]")
                 for key, val in nix_diagnostics().items():
                     rprint(f"   [dim]{key}[/dim] = {val}")
                 raise
-        _step("เชื่อมเครื่องมือเข้า PATH")
-        link_tools()
-        missing = missing_tools()
-        if missing:
-            rprint(
-                f"[yellow]⚠️ ไม่พบเครื่องมือใน PATH: {', '.join(missing)} — ถ้าเพิ่งรันเซลล์ 1 ไม่จบ "
-                "ให้รันใหม่ หรือโหลดโมเดลจะพังด้วย `command not found`[/yellow]"
-            )
-        _step("สร้าง venv + ติดตั้ง dependency")
-        ensure_venv()
-        venv_site = activate_venv()
-        mode = "nix"
-    else:
+        if use_nix:
+            _step("เชื่อมเครื่องมือเข้า PATH")
+            link_tools()
+            missing = missing_tools()
+            if missing:
+                rprint(
+                    f"[yellow]⚠️ ไม่พบเครื่องมือใน PATH: {', '.join(missing)} — ถ้าเพิ่งรันเซลล์ 1 ไม่จบ "
+                    "ให้รันใหม่ หรือโหลดโมเดลจะพังด้วย `command not found`[/yellow]"
+                )
+            _step("สร้าง venv + ติดตั้ง dependency")
+            ensure_venv()
+            venv_site = activate_venv()
+            mode = "nix"
+    if not use_nix:
         _step("ติดตั้งแพ็กเกจ Python ด้วย pip")
         pkgs = [*PIP_ONLY_DEPS]
         if not _is_colab_runtime():
@@ -544,6 +587,40 @@ def _current_site_packages() -> str:
     return paths[0] if paths else str(default_sp)
 
 
+def _pip_freeze_pins() -> dict[str, str]:
+    """เวอร์ชันของทุกแพ็กเกจที่ติดตั้งอยู่ตอนนี้ (ชื่อ → เวอร์ชัน) เอาไปทำ constraints"""
+    out = subprocess.run(
+        [sys.executable, "-m", "pip", "freeze", "--all"],
+        capture_output=True, text=True, check=False,
+    ).stdout
+    pins: dict[str, str] = {}
+    for ln in out.splitlines():
+        ln = ln.strip()
+        if "==" not in ln or ln.startswith(("-e", "#", "pip==")):
+            continue
+        name, _, ver = ln.partition("==")
+        if not name or not ver or "@" in ver or " " in name or name.startswith("-"):
+            continue
+        pins[name] = ver
+    return pins
+
+
+def pip_constraints_file() -> Path | None:
+    """สร้างไฟล์ constraints จากเวอร์ชันที่ติดตั้งอยู่ เพื่อไม่ให้ pip อัปเกรดของที่แพลตฟอร์มผูกมา
+
+    เคสจริงบน Kaggle: ``huggingface-hub`` ดึง ``fsspec`` ใหม่ → ``datasets`` พัง
+    (fsspec<=2026.2.0) และ ``fastembed`` ดึง ``pillow`` 13 → ``gradio`` พัง (pillow<13)
+    """
+    pins = _pip_freeze_pins()
+    if not pins:
+        return None
+    path = Path(tempfile.gettempdir()) / "strata-pip-constraints.txt"
+    with contextlib.suppress(OSError):
+        path.write_text("".join(f"{n}=={v}\n" for n, v in sorted(pins.items())), encoding="utf-8")
+        return path
+    return None
+
+
 def _pip_install_deps(dep_list: list[str] | None = None) -> None:
     use_deps = dep_list if dep_list is not None else PIP_ONLY_DEPS
     base = f"{shlex.quote(sys.executable)} -m pip install -q"
@@ -555,9 +632,18 @@ def _pip_install_deps(dep_list: list[str] | None = None) -> None:
             [sys.executable, "-m", "pip", "install", "-q", "hf_transfer"],
             capture_output=True, text=True, check=False,
         )
-    try:
-        run_stream(f"set -e\n{base} --upgrade pip\n{base} {deps}")
-    except subprocess.CalledProcessError:
+    constraints = pip_constraints_file()
+    attempts: list[tuple[str, str]] = []
+    if constraints is not None:
+        attempts.append((f"{base} -c {shlex.quote(str(constraints))} {deps}", "ล็อกเวอร์ชันที่ติดตั้งอยู่"))
+    attempts.append((f"{base} {deps}", "ไม่ล็อกเวอร์ชัน"))
+    for cmd, label in attempts:
+        try:
+            run_stream(f"set -e\n{base} --upgrade pip\n{cmd}")
+            break
+        except subprocess.CalledProcessError:
+            rprint(f"[yellow]⚠️ pip install ไม่ผ่าน ({label}) — ลองวิธีถัดไป[/yellow]")
+    else:
         rprint("[yellow]⚠️ pip ปกติไม่ผ่าน (อาจเป็น externally-managed) — ลองใหม่ด้วย --break-system-packages[/yellow]")
         run_stream(f"set -e\n{base} --break-system-packages {deps}")
     importlib.invalidate_caches()

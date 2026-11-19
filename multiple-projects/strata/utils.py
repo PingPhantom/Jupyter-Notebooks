@@ -320,15 +320,81 @@ def _safe_extract_zip(zf: zipfile.ZipFile, dest: Path) -> None:
     zf.extractall(root)
 
 
-def _download_and_extract(url: str, name: str, dest: Path):
-    arc = dest / name
+def _size_txt(num_bytes: float) -> str:
+    """แปลงไบต์เป็นข้อความสั้น ๆ (ใช้กับการ์ดความคืบหน้า)"""
+    if num_bytes >= 1024 ** 3:
+        return f"{num_bytes / 1024 ** 3:.2f} GB"
+    if num_bytes >= 1024 ** 2:
+        return f"{num_bytes / 1024 ** 2:.0f} MB"
+    if num_bytes >= 1024:
+        return f"{num_bytes / 1024:.0f} KB"
+    return f"{int(num_bytes)} B"
+
+
+def download_progress(
+    url: str,
+    dest_path: Path,
+    *,
+    label: str = "",
+    prefix: str = "   ",
+    every: float = 1.0,
+) -> Path:
+    """ดาวน์โหลดแบบสตรีม พร้อมพิมพ์ % ความคืบหน้าทุก ๆ ``every`` วินาที
+
+    ใช้ ``Content-Length`` ของเซิร์ฟเวอร์เป็นตัวหาร — ถ้าเซิร์ฟเวอร์ไม่ส่งขนาดมา จะพิมพ์
+    ปริมาณที่โหลดไปแล้วอย่างเดียว (ไม่เดา % ให้เข้าใจผิด)
+    """
+    dest_path = Path(dest_path)
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    label = label or dest_path.name
+    started = time.perf_counter()
+    done = 0
+    last_print = 0.0
     with requests.get(url, stream=True, timeout=180) as r:
         r.raise_for_status()
-        with open(arc, "wb") as f:
-            for ch in r.iter_content(chunk_size=1024 * 1024):
-                if ch:
-                    f.write(ch)
+        total = int(r.headers.get("Content-Length") or r.headers.get("content-length") or 0)
+        with open(dest_path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=1024 * 256):
+                if not chunk:
+                    continue
+                f.write(chunk)
+                done += len(chunk)
+                now = time.perf_counter()
+                if now - last_print < every or (total and done >= total):
+                    continue  # บรรทัด 100% มีอยู่แล้วในสรุปท้ายฟังก์ชัน
+                last_print = now
+                speed = done / max(now - started, 1e-6)
+                if total:
+                    pct = 100.0 * done / total
+                    bar_len = 20
+                    filled = int(bar_len * pct / 100)
+                    bar = "█" * filled + "░" * (bar_len - filled)
+                    _progress_print(f"{prefix}⬇️ {label}: {bar} {pct:5.1f}% "
+                                    f"({_size_txt(done)}/{_size_txt(total)} · {_size_txt(speed)}/s)")
+                else:
+                    _progress_print(f"{prefix}⬇️ {label}: {_size_txt(done)} · {_size_txt(speed)}/s")
+    if total and done < total:
+        _progress_print(f"{prefix}⚠️ {label}: โหลดได้ {_size_txt(done)} จาก {_size_txt(total)} (เซิร์ฟเวอร์ปิดการเชื่อมต่อก่อน)")
+    elif total:
+        _progress_print(f"{prefix}✅ {label}: 100.0% ({_size_txt(done)}) ใช้เวลา {time.perf_counter() - started:.0f}s")
+    return dest_path
+
+
+def _progress_print(text: str) -> None:
+    """พิมพ์บรรทัดความคืบหน้า — ใช้ rich ถ้ามี ไม่งั้น print ธรรมดา"""
     try:
+        from rich import print as rprint
+
+        rprint(f"[cyan]{text}[/cyan]")
+    except Exception:  # noqa: BLE001
+        print(text, flush=True)
+
+
+def _download_and_extract(url: str, name: str, dest: Path, label: str = ""):
+    arc = dest / name
+    download_progress(url, arc, label=label or name, prefix="   ")
+    try:
+        _progress_print(f"   📦 แตกไฟล์ {label or name} → {dest} …")
         if name.endswith(".tar.gz"):
             with tarfile.open(arc, "r:gz") as tf:
                 _safe_extract_tar(tf, dest)

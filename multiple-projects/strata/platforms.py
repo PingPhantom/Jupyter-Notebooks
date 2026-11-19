@@ -37,13 +37,13 @@ def detect(env: dict[str, str] | None = None, exists=None, writable=None) -> dic
     writable = writable or _default_writable
 
     is_kaggle = any(k.startswith("KAGGLE_") for k in env) or exists(KAGGLE_WORK)
-    # COLAB_RELEASE_TAG Colab ใส่ให้เองเสมอ → เป็นสัญญาณที่ชนะ KAGGLE_* ที่อาจติดมาจากอิมเมจเดียวกัน
-    colab_certain = "COLAB_RELEASE_TAG" in env
+    # Kaggle บางอิมเมจติด COLAB_RELEASE_TAG/COLAB_GPU/โฟลเดอร์ /content มาด้วย
+    # → ถ้ามีสัญญาณ Kaggle ให้เชื่อ Kaggle ก่อนเสมอ ไม่งั้นจะไปเข้าโหมด Colab (invokeFunction/proxyPort/Nix)
+    # แล้วพังทั้งเซลล์ (Kaggle ไม่มีทั้ง Colab RPC และ /content ที่เขียนได้)
+    colab_certain = ("COLAB_RELEASE_TAG" in env) and not is_kaggle
     is_colab = colab_certain or (("COLAB_GPU" in env or exists(COLAB_HOME)) and not is_kaggle)
 
-    if colab_certain:
-        name = "colab"
-    elif is_kaggle:
+    if is_kaggle:
         name = "kaggle"
     elif is_colab:
         name = "colab"
