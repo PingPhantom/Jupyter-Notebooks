@@ -544,6 +544,40 @@ def _current_site_packages() -> str:
     return paths[0] if paths else str(default_sp)
 
 
+def _pip_freeze_pins() -> dict[str, str]:
+    """เวอร์ชันของทุกแพ็กเกจที่ติดตั้งอยู่ตอนนี้ (ชื่อ → เวอร์ชัน) เอาไปทำ constraints"""
+    out = subprocess.run(
+        [sys.executable, "-m", "pip", "freeze", "--all"],
+        capture_output=True, text=True, check=False,
+    ).stdout
+    pins: dict[str, str] = {}
+    for ln in out.splitlines():
+        ln = ln.strip()
+        if "==" not in ln or ln.startswith(("-e", "#", "pip==")):
+            continue
+        name, _, ver = ln.partition("==")
+        if not name or not ver or "@" in ver or " " in name or name.startswith("-"):
+            continue
+        pins[name] = ver
+    return pins
+
+
+def pip_constraints_file() -> Path | None:
+    """สร้างไฟล์ constraints จากเวอร์ชันที่ติดตั้งอยู่ เพื่อไม่ให้ pip อัปเกรดของที่แพลตฟอร์มผูกมา
+
+    เคสจริงบน Kaggle: ``huggingface-hub`` ดึง ``fsspec`` ใหม่ → ``datasets`` พัง
+    (fsspec<=2026.2.0) และ ``fastembed`` ดึง ``pillow`` 13 → ``gradio`` พัง (pillow<13)
+    """
+    pins = _pip_freeze_pins()
+    if not pins:
+        return None
+    path = Path(tempfile.gettempdir()) / "strata-pip-constraints.txt"
+    with contextlib.suppress(OSError):
+        path.write_text("".join(f"{n}=={v}\n" for n, v in sorted(pins.items())), encoding="utf-8")
+        return path
+    return None
+
+
 def _pip_install_deps(dep_list: list[str] | None = None) -> None:
     use_deps = dep_list if dep_list is not None else PIP_ONLY_DEPS
     base = f"{shlex.quote(sys.executable)} -m pip install -q"
@@ -555,9 +589,18 @@ def _pip_install_deps(dep_list: list[str] | None = None) -> None:
             [sys.executable, "-m", "pip", "install", "-q", "hf_transfer"],
             capture_output=True, text=True, check=False,
         )
-    try:
-        run_stream(f"set -e\n{base} --upgrade pip\n{base} {deps}")
-    except subprocess.CalledProcessError:
+    constraints = pip_constraints_file()
+    attempts: list[tuple[str, str]] = []
+    if constraints is not None:
+        attempts.append((f"{base} -c {shlex.quote(str(constraints))} {deps}", "ล็อกเวอร์ชันที่ติดตั้งอยู่"))
+    attempts.append((f"{base} {deps}", "ไม่ล็อกเวอร์ชัน"))
+    for cmd, label in attempts:
+        try:
+            run_stream(f"set -e\n{base} --upgrade pip\n{cmd}")
+            break
+        except subprocess.CalledProcessError:
+            rprint(f"[yellow]⚠️ pip install ไม่ผ่าน ({label}) — ลองวิธีถัดไป[/yellow]")
+    else:
         rprint("[yellow]⚠️ pip ปกติไม่ผ่าน (อาจเป็น externally-managed) — ลองใหม่ด้วย --break-system-packages[/yellow]")
         run_stream(f"set -e\n{base} --break-system-packages {deps}")
     importlib.invalidate_caches()
