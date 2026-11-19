@@ -11,6 +11,7 @@ dispatcher ที่ส่งเข้ามา → แผงนี้ไม่�
 
 from __future__ import annotations
 
+import base64
 import contextlib
 import html as _html
 import threading
@@ -150,8 +151,8 @@ def studio_console(
 
     head = widgets.HTML(
         f"{_CSS}<div class='hy-root'><div class='hy-title'>{_esc(title)}</div>"
-        "<div class='hy-sub'>หน้าจอ HTML ด้านบนเป็นชุดเดียวกับ Colab แต่บนแพลตฟอร์มนี้ JS สั่ง kernel ตรง ๆ ไม่ได้ "
-        "— ใช้แผงนี้สั่งงานแทน (ปุ่มในหน้าจอด้านบนจะกดไม่ติด)</div></div>"
+        "<div class='hy-sub'>frontend นี้บล็อกสคริปต์ใน output จึงใช้หน้าจอ HTML สั่ง kernel ไม่ได้ "
+        "— แผงนี้คือชุดควบคุมเดียวกับ Colab ครบทุกปุ่ม (ทำงานผ่าน comm ของ ipywidgets)</div></div>"
     )
     status = widgets.HTML(f"<div class='hy-root'>{_status_html(bridge)}</div>")
     refresh_btn = widgets.Button(description="🔄 รีเฟรชสถานะ", layout=widgets.Layout(width="150px"))
@@ -176,6 +177,29 @@ def studio_console(
         with contextlib.suppress(Exception):
             spec_dd.value = str(state["spec"].get("mode") or "auto")
             kv_cb.value = bool(state["spec"].get("kv_q8", True))
+
+    # แคตตาล็อกทั้งหมด — เห็นครบทุกโมเดลพร้อมสถานะติดตั้ง/ขนาด/ความพอดี
+    all_models = bridge.models()
+    cat_dd = widgets.Select(
+        options=[(_lab(m), m["key"]) for m in all_models] or [("(ไม่มี)", "")],
+        rows=12, layout=widgets.Layout(width="100%"),
+    )
+    kind_dd = widgets.Dropdown(
+        options=[("ทั้งหมด", "all"), ("ข้อความ", "text"), ("ภาพ", "image"), ("LoRA", "lora")],
+        description="กรอง", layout=widgets.Layout(width="220px"),
+    )
+    cat_dl = _btn(widgets, "📥 โหลดรุ่นนี้", "pri")
+    cat_run = _btn(widgets, "🚀 รันรุ่นนี้", "suc")
+    cat_link = _btn(widgets, "🔗 เชื่อมเข้าโหนดภาพ")
+    cat_del = _btn(widgets, "🗑 ลบรุ่นนี้", "dng")
+    cat_out = widgets.HTML("")
+
+    drafts = list(state.get("drafts") or [])
+    draft_dd = widgets.Dropdown(
+        options=[(str(d.get("label") or d.get("key")), d["key"]) for d in drafts] or [("(ไม่มี Draft)", "")],
+        description="Draft", layout=widgets.Layout(width="100%"),
+    )
+    draft_btn = _btn(widgets, "📥 โหลด Draft")
 
     dl_btn = _btn(widgets, "📥 โหลด", "pri")
     run_btn = _btn(widgets, "🚀 รัน & แชท", "suc")
@@ -203,7 +227,36 @@ def studio_console(
     # ---------- ซิงก์โหนด 4–7 ----------
     wf_in = widgets.Textarea(placeholder="ข้อความตั้งต้น (เว้นว่าง = ใช้แชทล่าสุด)",
                              layout=widgets.Layout(width="100%", height="56px"))
+    wf_model_dd = widgets.Dropdown(
+        options=[(str((state.get("sync") or {}).get("active_model") or "(ยังไม่เลือก)"), "")],
+        description="โมเดลภาพ", layout=widgets.Layout(width="100%"),
+    )
+    _sync0 = state.get("sync") or {}
+    wf_lora_dd = widgets.Dropdown(options=[("(ไม่ใช้ LoRA)", "")], description="LoRA",
+                                  layout=widgets.Layout(width="100%"))
+    wf_str = widgets.FloatSlider(value=1.0, min=0.0, max=2.0, step=0.05, description="strength",
+                                 layout=widgets.Layout(width="300px"))
+    with contextlib.suppress(Exception):
+        _loras0 = [str(x) for x in (state.get("ready_loras") or [])]
+        wf_lora_dd.options = [("(ไม่ใช้ LoRA)", "")] + [(n, n) for n in _loras0]
+        if str(_sync0.get("active_lora") or "") in _loras0:
+            wf_lora_dd.value = str(_sync0["active_lora"])
+        if _sync0.get("lora_strength") is not None:
+            wf_str.value = float(_sync0.get("lora_strength") or 1.0)
+    wf_sync_btn = _btn(widgets, "💾 ซิงก์ที่เลือกเข้าเซลล์ 3")
     wf_btn = _btn(widgets, "🔗 แต่งโหนด 4–7")
+
+    # ---------- คลัง RAG ----------
+    rag_text = widgets.Textarea(placeholder="วางข้อความ/โน้ตเพื่อเพิ่มเข้าคลัง RAG…",
+                                layout=widgets.Layout(width="100%", height="80px"))
+    rag_add = _btn(widgets, "➕ เพิ่มเข้าคลัง", "pri")
+    rag_query = widgets.Text(placeholder="คำค้นในคลัง…", layout=widgets.Layout(width="100%"))
+    rag_find = _btn(widgets, "🔎 ค้น")
+    rag_save = _btn(widgets, "💾 บันทึก")
+    rag_load = _btn(widgets, "📂 โหลด")
+    rag_clear = _btn(widgets, "🧹 ล้างคลัง", "dng")
+    rag_up = widgets.FileUpload(accept=".txt,.md,.pdf,.json", multiple=False, description="📄 อัปโหลด")
+    rag_out = widgets.HTML("<div class='hy-root'><div class='hy-dim'>ยังไม่มีข้อมูลในคลัง</div></div>")
     wf_cancel = _btn(widgets, "⏹ ยกเลิกงาน", "dng")
     wf_out = widgets.HTML("")
 
@@ -214,10 +267,22 @@ def studio_console(
 
     def _refresh_models(*_a):
         bridge.refresh()
+        prev = {w: w.value for w in (text_dd, image_dd, cat_dd, wf_model_dd, wf_lora_dd, draft_dd)}
         tm = bridge.models(("text",))
         im = bridge.models(("image",))
         text_dd.options = [(_lab(m), m["key"]) for m in tm] or [("(ไม่มี)", "")]
         image_dd.options = [(_lab(m), m["key"]) for m in im] or [("(ไม่มี)", "")]
+        _fill_cat(str(kind_dd.value))
+        st = dict(bridge.state)
+        drafts_now = list(st.get("drafts") or [])
+        draft_dd.options = [(str(d.get("label") or d.get("key")), d["key"]) for d in drafts_now] or [("(ไม่มี Draft)", "")]
+        wf_model_dd.options = [(_lab(m), m["key"]) for m in im] or [("(ยังไม่มีโมเดลภาพ)", "")]
+        loras = [str(x) for x in (st.get("ready_loras") or [])]
+        wf_lora_dd.options = [("(ไม่ใช้ LoRA)", "")] + [(n, n) for n in loras]
+        for w, v in prev.items():  # คงตัวเลือกเดิมไว้ถ้ายังมีอยู่ในรายการใหม่
+            with contextlib.suppress(Exception):
+                if v in [o[1] for o in w.options]:
+                    w.value = v
         _sync_status()
 
     def _op(kind: str, key: str, op: str):
@@ -314,6 +379,103 @@ def studio_console(
                 pass
         threading.Thread(target=_job, daemon=True).start()
 
+    def _fill_cat(kind: str = "all") -> None:
+        items = bridge.models() if kind == "all" else [m for m in bridge.models() if m["kind"] == kind]
+        cat_dd.options = [(_lab(m), m["key"]) for m in items] or [("(ไม่มี)", "")]
+
+    def _cat_op(op: str):
+        key = str(cat_dd.value or "")
+        if not key:
+            cat_out.value = "<div class='hy-root hy-warn'>เลือกโมเดลจากรายการก่อนครับ</div>"
+            return
+        res = bridge.call("model_op", {"op": op, "key": key})
+        note = res.get("notice") or res.get("error") or f"{op} {key}"
+        cls = "hy-err" if res.get("error") else "hy-ok"
+        cat_out.value = f"<div class='hy-root'><span class='{cls}'>{_esc(note)}</span></div>"
+        _refresh_models()
+
+    def _on_link(_b):
+        key = str(cat_dd.value or "")
+        if not key:
+            cat_out.value = "<div class='hy-root hy-warn'>เลือกโมเดล/LoRA ก่อนครับ</div>"
+            return
+        res = bridge.call("link_image", {"key": key})
+        note = res.get("notice") or res.get("error") or f"เชื่อม {key} แล้ว"
+        cls = "hy-err" if res.get("error") else "hy-ok"
+        cat_out.value = f"<div class='hy-root'><span class='{cls}'>{_esc(note)}</span></div>"
+        _refresh_models()
+
+    def _on_draft(_b):
+        key = str(draft_dd.value or "")
+        if not key:
+            cat_out.value = "<div class='hy-root hy-warn'>ยังไม่มี Draft ให้โหลด</div>"
+            return
+        bridge.call("dl_draft", {"key": key})
+        cat_out.value = f"<div class='hy-root hy-warn'>⏳ กำลังโหลด Draft {_esc(key)} — กด 🔄 รีเฟรชสถานะอีกครั้ง</div>"
+
+    def _on_kind(*_a):
+        _fill_cat(str(kind_dd.value))
+
+    # ---------- RAG ----------
+    def _rag_out(msg: str, cls: str = "hy-ok"):
+        rag_out.value = f"<div class='hy-root'><span class='{cls}'>{_esc(msg)}</span></div>"
+
+    def _on_rag_add(_b):
+        txt = str(rag_text.value or "").strip()
+        if not txt:
+            _rag_out("ยังไม่มีข้อความให้เพิ่ม", "hy-warn")
+            return
+        res = bridge.call("rag_op", {"op": "add_text", "text": txt})
+        _rag_out(str(res.get("msg") or res.get("error") or "เพิ่มแล้ว"))
+        rag_text.value = ""
+        _sync_status()
+
+    def _on_rag_find(_b):
+        res = bridge.call("rag_op", {"op": "search", "query": str(rag_query.value or "")})
+        hits = res.get("hits") or []
+        if not hits:
+            _rag_out("ไม่พบข้อมูลที่ตรงกับคำค้น", "hy-warn")
+            return
+        rows = "".join(
+            f"<div class='hy-pre'>{_esc(str((h.get('text') if isinstance(h, dict) else h))[:300])}</div>"
+            for h in hits[:4]
+        )
+        rag_out.value = f"<div class='hy-root'><div class='hy-ok'>🔎 พบ {len(hits)} ชิ้น</div>{rows}</div>"
+
+    def _on_rag_simple(op: str):
+        def _h(_b):
+            res = bridge.call("rag_op", {"op": op})
+            _rag_out(str(res.get("msg") or res.get("error") or op), "hy-err" if res.get("ok") is False else "hy-ok")
+            _sync_status()
+        return _h
+
+    def _on_rag_upload(change):
+        up = change.get("new") if isinstance(change, dict) else None
+        if not up:
+            return
+        if isinstance(up, dict):  # ipywidgets 7: {name: {"content": b"..."}}
+            name = str(next(iter(up)))
+            raw = (up[name] or {}).get("content") if isinstance(up[name], dict) else up[name]
+        else:  # ipywidgets 8: ({"name": ..., "content": b"..."}, ...)
+            first = next(iter(up), {}) or {}
+            name = str(first.get("name") or "upload.bin")
+            raw = first.get("content")
+        payload = {"op": "upload", "name": name, "b64": base64.b64encode(bytes(raw or b"")).decode("ascii")}
+        res = bridge.call("rag_op", payload)
+        _rag_out(str(res.get("msg") or res.get("error") or f"อัปโหลด {name} แล้ว"))
+        _sync_status()
+
+    def _on_wf_sync(_b):
+        payload: dict[str, Any] = {"lora_strength": float(wf_str.value)}
+        if wf_model_dd.value:
+            payload["active_model"] = str(wf_model_dd.value)
+        payload["active_lora"] = str(wf_lora_dd.value or "")
+        if wf_in.value.strip():
+            payload["prompt"] = wf_in.value
+        bridge.call("sync_comfy_sel", payload)
+        wf_out.value = "<div class='hy-root hy-ok'>💾 ซิงก์ตัวเลือกเข้าเซลล์ 3 แล้ว</div>"
+        _sync_status()
+
     dl_btn.on_click(lambda _b: _op("text", text_dd.value, "download"))
     run_btn.on_click(lambda _b: _op("text", text_dd.value, "run"))
     del_btn.on_click(lambda _b: _op("text", text_dd.value, "delete"))
@@ -330,8 +492,26 @@ def studio_console(
     gen_btn.on_click(_on_gen)
     wf_btn.on_click(_on_wf)
     wf_cancel.on_click(_on_cancel)
+    wf_sync_btn.on_click(_on_wf_sync)
+    kind_dd.observe(_on_kind, names="value")
+    cat_dl.on_click(lambda _b: _cat_op("download"))
+    cat_run.on_click(lambda _b: _cat_op("run"))
+    cat_del.on_click(lambda _b: _cat_op("delete"))
+    cat_link.on_click(_on_link)
+    draft_btn.on_click(_on_draft)
+    rag_add.on_click(_on_rag_add)
+    rag_find.on_click(_on_rag_find)
+    rag_save.on_click(_on_rag_simple("save"))
+    rag_load.on_click(_on_rag_simple("load"))
+    rag_clear.on_click(_on_rag_simple("clear"))
+    rag_up.observe(_on_rag_upload, names="value")
 
     models_box = widgets.VBox([
+        widgets.HTML(f"<div class='hy-root'><b>📚 แคตตาล็อกทั้งหมด ({len(all_models)} รุ่น)</b>"
+                     "<div class='hy-dim' style='font-size:11.5px'>รูปแบบ: ชื่อ · ติดตั้งแล้ว · ขนาด · ความพอดี VRAM</div></div>"),
+        kind_dd, cat_dd, widgets.HBox([cat_dl, cat_run, cat_link, cat_del]), cat_out,
+        widgets.HTML("<div class='hy-root'><b>⚡ Draft (speculative)</b></div>"),
+        draft_dd, widgets.HBox([draft_btn]),
         widgets.HTML("<div class='hy-root'><b>🚀 โมเดลข้อความ</b></div>"),
         text_dd, widgets.HBox([dl_btn, run_btn, del_btn]),
         widgets.HTML("<div class='hy-root'><b>🎨 โมเดลภาพ</b></div>"),
@@ -342,9 +522,16 @@ def studio_console(
     ])
     chat_box = widgets.VBox([chat_in, widgets.HBox([rag_cb, temp_sl]), widgets.HBox([send_btn, regen_btn, clear_btn]), chat_out])
     image_box = widgets.VBox([img_in, widgets.HBox([gen_btn]), img_out])
-    wf_box = widgets.VBox([wf_in, widgets.HBox([wf_btn, wf_cancel]), wf_out])
-    acc = widgets.Accordion(children=[models_box, chat_box, image_box, wf_box])
-    for i, t in enumerate(("🚀 โมเดล & โหมด", "💬 แชท", "🖼️ สร้างภาพ", "🔗 ซิงก์โหนด 4–7")):
+    wf_box = widgets.VBox([
+        widgets.HTML("<div class='hy-root'><b>🎨 เลือกโมเดลภาพ / LoRA ที่จะซิงก์</b></div>"),
+        wf_model_dd, wf_lora_dd, wf_str, widgets.HBox([wf_sync_btn]),
+        widgets.HTML("<div class='hy-root'><b>🔗 แต่งโหนด 4–7</b></div>"),
+        wf_in, widgets.HBox([wf_btn, wf_cancel]), wf_out,
+    ])
+    rag_box = widgets.VBox([rag_text, widgets.HBox([rag_add]), rag_up, rag_query,
+                            widgets.HBox([rag_find, rag_save, rag_load, rag_clear]), rag_out])
+    acc = widgets.Accordion(children=[models_box, chat_box, image_box, wf_box, rag_box])
+    for i, t in enumerate(("🚀 โมเดล & โหมด", "💬 แชท", "🖼️ สร้างภาพ", "🔗 ซิงก์โหนด 4–7", "📚 คลัง RAG")):
         acc.set_title(i, t)
     acc.selected_index = 1
 
@@ -366,8 +553,8 @@ def comfy_console(
 
     head = widgets.HTML(
         f"{_CSS}<div class='hy-root'><div class='hy-title'>{_esc(title)}</div>"
-        "<div class='hy-sub'>หน้าจอ ComfyUI ด้านบนเป็นชุดเดียวกับ Colab แต่รับคำสั่งจาก JS ไม่ได้บนแพลตฟอร์มนี้ "
-        "— กรอกด้านล่างแล้วกดสร้างภาพได้เลย</div></div>"
+        "<div class='hy-sub'>frontend นี้บล็อกสคริปต์ใน output จึงใช้หน้าจอ HTML สั่ง kernel ไม่ได้ "
+        "— กรอกด้านล่างแล้วกดสร้างภาพได้เลย (คำสั่งชุดเดียวกับปุ่มในหน้าจอ Colab)</div></div>"
     )
     status = widgets.HTML(f"<div class='hy-root'>{_status_html(bridge)}</div>")
     prompt = widgets.Textarea(placeholder="คำบรรยายภาพ (positive)…",
