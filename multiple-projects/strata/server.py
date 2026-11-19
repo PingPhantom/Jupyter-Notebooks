@@ -727,8 +727,11 @@ def install_llama_server(install_dir: str = LLAMA_CPP_DIR) -> str:
         raise RuntimeError("ไม่พบไฟล์ Prebuilt llama-server")
     dest = Path(install_dir); shutil.rmtree(dest, ignore_errors=True); dest.mkdir(parents=True, exist_ok=True)
     if cudart_asset:
-        _download_and_extract(cudart_asset["browser_download_url"], cudart_asset["name"], dest)
-    _download_and_extract(main_asset["browser_download_url"], main_asset["name"], dest)
+        _download_and_extract(cudart_asset["browser_download_url"], cudart_asset["name"], dest,
+                              label=f"CUDA runtime {cudart_asset['name']}")
+    _download_and_extract(main_asset["browser_download_url"], main_asset["name"], dest,
+                          label=f"llama-server {main_asset['name']}")
+    rprint("[cyan]   🔧 ตั้งค่า wrapper ให้ชี้ไบนารีใหม่…[/cyan]")
     srv_bins = [p for p in dest.rglob("llama-server") if p.is_file()]
     if not srv_bins:
         raise RuntimeError("ไม่พบไบนารี llama-server")

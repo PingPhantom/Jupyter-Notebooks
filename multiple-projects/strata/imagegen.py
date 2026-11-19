@@ -24,6 +24,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 import time
 import urllib.request
 from collections.abc import Callable
@@ -551,14 +552,38 @@ def _fetch_tarball(repo_url: str, dest: Path) -> None:
     last = ""
     for br in TARBALL_BRANCHES:
         url = f"https://codeload.github.com/{slug}/tar.gz/refs/heads/{br}"
+        buf, total = bytearray(), 0
         try:
-            with urllib.request.urlopen(url, timeout=180) as r:
-                data = r.read()
+            req = urllib.request.Request(url, headers={"User-Agent": CHROME_UA})
+            with urllib.request.urlopen(req, timeout=180) as r:
+                total = int(r.headers.get("Content-Length") or 0)
+                started, last_print = time.perf_counter(), 0.0
+                while True:
+                    chunk = r.read(256 * 1024)
+                    if not chunk:
+                        break
+                    buf.extend(chunk)
+                    now = time.perf_counter()
+                    if now - last_print < 1.0 and not (total and len(buf) >= total):
+                        continue
+                    last_print = now
+                    speed = len(buf) / max(now - started, 1e-6)
+                    if total:
+                        pct = 100.0 * len(buf) / total
+                        filled = int(16 * pct / 100)
+                        bar = "█" * filled + "░" * (16 - filled)
+                        _say(f"⬇️ tarball {slug}@{br} [{bar}] {pct:5.1f}% "
+                             f"({len(buf) / 1024**2:.0f}/{total / 1024**2:.0f} MB · {speed / 1024**2:.1f} MB/s)")
+                    else:
+                        _say(f"⬇️ tarball {slug}@{br}: {len(buf) / 1024**2:.0f} MB · {speed / 1024**2:.1f} MB/s")
         except Exception as e:  # noqa: BLE001
             last = f"{br}: {e}"
             continue
-        _say(f"⬇️ ดาวน์โหลด tarball {slug}@{br} (~{len(data) / 1024**2:.0f} MB)")
-        _extract_tarball(data, dest)
+        if not buf:
+            last = f"{br}: ไม่ได้รับข้อมูล"
+            continue
+        _say(f"⬇️ tarball {slug}@{br} ครบ 100% ({len(buf) / 1024**2:.0f} MB) → แตกไฟล์…")
+        _extract_tarball(bytes(buf), dest)
         return
     raise RuntimeError(f"ดาวน์โหลด {slug} เป็น tarball ไม่สำเร็จ ({last})")
 
@@ -629,10 +654,24 @@ def _is_legacy_gguf_node(node_dir: Path) -> bool:
 def _pip_install_comfy(*pip_args: str) -> None:
     py = shlex.quote(sys.executable)
     joined = " ".join(shlex.quote(a) for a in pip_args)
+    # pip ไม่บอก % (ขนาดแพ็กเกจไม่รู้ล่วงหน้า) → ใช้ heartbeat บอกเวลาที่ผ่านไปแทนการค้างเงียบ
+    stop = threading.Event()
+    t0 = time.perf_counter()
+
+    def _beat() -> None:
+        while not stop.wait(15.0):
+            _say(f"🎨 ComfyUI … pip กำลังติดตั้ง {joined[:70]} ({time.perf_counter() - t0:.0f}s)")
+
+    beat = threading.Thread(target=_beat, daemon=True)
+    beat.start()
     try:
-        run_stream(f"{py} -m pip install -q {joined}")
-    except subprocess.CalledProcessError:
-        run_stream(f"{py} -m pip install -q --break-system-packages {joined}")
+        try:
+            run_stream(f"{py} -m pip install -q {joined}")
+        except subprocess.CalledProcessError:
+            run_stream(f"{py} -m pip install -q --break-system-packages {joined}")
+    finally:
+        stop.set()
+        _say(f"🎨 ComfyUI … pip เสร็จใน {time.perf_counter() - t0:.0f}s ({joined[:70]})")
 
 
 def _install_req_preserving_cuda_torch(req_file: Path) -> None:
@@ -665,31 +704,49 @@ def ensure_fast_cache_node(comfy_dir: str | Path = COMFY_DIR) -> tuple[Path, boo
     return init_py, True
 
 
+def _comfy_stage(pct: int, msg: str, t0: float | None = None) -> None:
+    """พิมพ์ความคืบหน้าเป็น % ของการติดตั้ง ComfyUI (บอกได้ว่าตอนนี้อยู่ขั้นไหน)"""
+    tail = f" · {time.perf_counter() - t0:.0f}s" if t0 else ""
+    filled = int(16 * max(0, min(100, pct)) / 100)
+    bar = "█" * filled + "░" * (16 - filled)
+    _say(f"🎨 ComfyUI [{bar}] {pct:3d}% — {msg}{tail}")
+
+
 def ensure_comfyui(pull: bool = True, comfy_dir: str | Path = COMFY_DIR) -> Path:
+    t0 = time.perf_counter()
     root = Path(comfy_dir)
+    _comfy_stage(0, f"ตรวจของเดิมที่ {root}")
     if not (root / "main.py").is_file():
+        _comfy_stage(5, "โคลน/ดาวน์โหลด ComfyUI (ช่วงแรกกินเวลานานสุด)")
         _clone_or_tarball(COMFY_REPO, root, marker="main.py")
+        _comfy_stage(35, "ได้ตัว ComfyUI แล้ว", t0)
     elif pull:
         try:
             _run_git(["pull", "--ff-only"], cwd=root)
         except RuntimeError as e:
             rprint(f"[yellow]⚠️ อัปเดต ComfyUI ไม่ได้ (ใช้ของเดิมต่อ): {e}[/yellow]")
+    _comfy_stage(40, "ตรวจ custom node ComfyUI-GGUF", t0)
     node = root / "custom_nodes" / GGUF_NODE_DIRNAME
     if (node / "nodes.py").is_file() and _is_legacy_gguf_node(node):
         rprint("[yellow]🔄 พบ ComfyUI-GGUF รุ่นเก่า (city96) — กำลังสลับเป็น leejet/ComfyUI-GGUF เพื่อรองรับ Qwen-Image-2.1[/yellow]")
         shutil.rmtree(node, ignore_errors=True)
     if not (node / "nodes.py").is_file():
         _clear_incomplete(node)
+        _comfy_stage(45, "โคลน ComfyUI-GGUF", t0)
         _clone_or_tarball(GGUF_NODE_REPO, node, marker="nodes.py")
+    _comfy_stage(55, "custom node เสริม + เก็บลิงก์โมเดลที่เสีย", t0)
     ensure_fast_cache_node(root)
     _clean_broken_model_symlinks(root)
+    _comfy_stage(62, "ตรวจ PyTorch/CUDA (ติดตั้งใหม่ถ้าเป็น CPU-only)", t0)
     ensure_torch_runtime()
+    _comfy_stage(72, "ติดตั้ง requirements.txt ของ ComfyUI (pip)", t0)
     req = root / "requirements.txt"
     node_req = node / "requirements.txt"
     try:
         if req.is_file():
             _install_req_preserving_cuda_torch(req)
         if node_req.is_file():
+            _comfy_stage(80, "ติดตั้ง requirements ของ ComfyUI-GGUF", t0)
             _install_req_preserving_cuda_torch(node_req)
         _pip_install_comfy("--upgrade", "gguf", "comfyui-frontend-package")
     except subprocess.CalledProcessError as e:
@@ -697,9 +754,11 @@ def ensure_comfyui(pull: bool = True, comfy_dir: str | Path = COMFY_DIR) -> Path
             f"ติดตั้ง dependency ของ ComfyUI ไม่สำเร็จ (exit {e.returncode}) — "
             "ลองรัน `%s -m pip install -r %s` เองแล้วดู error แรก" % (sys.executable, req)
         ) from e
+    _comfy_stage(88, "ตรวจ PyTorch รอบสุดท้าย", t0)
     # ตรวจซ้ำอีกครั้งหลังลง requirements เผื่อแพ็กเกจย่อยไปแตะ torch
     ensure_torch_runtime()
     _comfy_help_flags.cache_clear()
+    _comfy_stage(100, "พร้อมใช้งาน", t0)
     rprint(f"[bold green]✅ ComfyUI พร้อม[/bold green] ที่ {root}")
     return root
 
