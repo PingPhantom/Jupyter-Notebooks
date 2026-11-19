@@ -75,6 +75,9 @@ SETUP_LOG = Path(STRATA_HOME) / "setup.log"
 
 
 def _is_colab_runtime() -> bool:
+    # Kaggle บางอิมเมจติด COLAB_* มาด้วย → ต้องกันไม่ให้เข้าใจผิดว่าเป็น Colab
+    if any(k.startswith("KAGGLE_") for k in os.environ) or Path("/kaggle/working").is_dir():
+        return False
     return "COLAB_RELEASE_TAG" in os.environ or "COLAB_GPU" in os.environ
 
 
